@@ -1,0 +1,893 @@
+diff --git a/core/modules/datetime/datetime.views.inc b/core/modules/datetime/datetime.views.inc
+index d3b0d18..93d6cd4 100644
+--- a/core/modules/datetime/datetime.views.inc
++++ b/core/modules/datetime/datetime.views.inc
+@@ -39,6 +39,8 @@ function datetime_field_views_data(FieldStorageConfigInterface $field_storage) {
+         'argument' => [
+           'field' => $field_storage->getName() . '_value',
+           'id' => 'datetime_' . $argument_type,
++          'entity_type' => $field_storage->getTargetEntityTypeId(),
++          'field_name' => $field_storage->getName(),
+         ],
+         'group' => $group,
+       ];
+diff --git a/core/modules/datetime/src/Plugin/views/argument/Date.php b/core/modules/datetime/src/Plugin/views/argument/Date.php
+index fb2bc4a..633627a 100644
+--- a/core/modules/datetime/src/Plugin/views/argument/Date.php
++++ b/core/modules/datetime/src/Plugin/views/argument/Date.php
+@@ -2,6 +2,9 @@
+
+ namespace Drupal\datetime\Plugin\views\Argument;
+
++use Drupal\Core\Routing\RouteMatchInterface;
++use Drupal\datetime\Plugin\Field\FieldType\DateTimeItem;
++use Drupal\views\FieldAPIHandlerTrait;
+ use Drupal\views\Plugin\views\argument\Date as NumericDate;
+
+ /**
+@@ -22,12 +25,36 @@
+  */
+ class Date extends NumericDate {
+
++  use FieldAPIHandlerTrait;
++
++  /**
++   * Determines if the timezone offset is calculated.
++   *
++   * @var bool
++   */
++  protected $calculateOffset = TRUE;
++
++  /**
++   * {@inheritdoc}
++   */
++  public function __construct(array $configuration, $plugin_id, $plugin_definition, RouteMatchInterface $route_match) {
++    parent::__construct($configuration, $plugin_id, $plugin_definition, $route_match);
++
++    $definition = $this->getFieldStorageDefinition();
++    if ($definition->getSetting('datetime_type') === DateTimeItem::DATETIME_TYPE_DATE) {
++      // Timezone offset calculation is not applicable to dates that are stored
++      // as date-only.
++      $this->calculateOffset = FALSE;
++    }
++  }
++
+   /**
+    * {@inheritdoc}
+    */
+   public function getDateField() {
+-    // Return the real field, since it is already in string format.
+-    return "$this->tableAlias.$this->realField";
++    // Use string date storage/formatting since datetime fields are stored as
++    // strings rather than UNIX timestamps.
++    return $this->query->getDateField("$this->tableAlias.$this->realField", TRUE, $this->calculateOffset);
+   }
+
+   /**
+diff --git a/core/modules/datetime/src/Plugin/views/filter/Date.php b/core/modules/datetime/src/Plugin/views/filter/Date.php
+index afd629a..12e19fe 100644
+--- a/core/modules/datetime/src/Plugin/views/filter/Date.php
++++ b/core/modules/datetime/src/Plugin/views/filter/Date.php
+@@ -2,6 +2,7 @@
+
+ namespace Drupal\datetime\Plugin\views\filter;
+
++use Drupal\Component\Datetime\DateTimePlus;
+ use Drupal\Core\Datetime\DateFormatterInterface;
+ use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
+ use Drupal\datetime\Plugin\Field\FieldType\DateTimeItem;
+@@ -41,6 +42,13 @@ class Date extends NumericDate implements ContainerFactoryPluginInterface {
+   protected $dateFormat = DATETIME_DATETIME_STORAGE_FORMAT;
+
+   /**
++   * Determines if the timezone offset is calculated.
++   *
++   * @var bool
++   */
++  protected $calculateOffset = TRUE;
++
++  /**
+    * The request stack used to determin current time.
+    *
+    * @var \Symfony\Component\HttpFoundation\RequestStack
+@@ -66,10 +74,13 @@ public function __construct(array $configuration, $plugin_id, $plugin_definition
+     $this->dateFormatter = $date_formatter;
+     $this->requestStack = $request_stack;
+
+-    // Date format depends on field storage format.
+     $definition = $this->getFieldStorageDefinition();
+     if ($definition->getSetting('datetime_type') === DateTimeItem::DATETIME_TYPE_DATE) {
++      // Date format depends on field storage format.
+       $this->dateFormat = DATETIME_DATE_STORAGE_FORMAT;
++      // Timezone offset calculation is not applicable to dates that are stored
++      // as date-only.
++      $this->calculateOffset = FALSE;
+     }
+   }
+
+@@ -90,21 +101,32 @@ public static function create(ContainerInterface $container, array $configuratio
+    * Override parent method, which deals with dates as integers.
+    */
+   protected function opBetween($field) {
+-    $origin = ($this->value['type'] == 'offset') ? $this->requestStack->getCurrentRequest()->server->get('REQUEST_TIME') : 0;
+-    $a = intval(strtotime($this->value['min'], $origin));
+-    $b = intval(strtotime($this->value['max'], $origin));
+-
+-    // Formatting will vary on date storage.
+-
++    $timezone = ($this->dateFormat === DATETIME_DATE_STORAGE_FORMAT)
++      ? DATETIME_STORAGE_TIMEZONE
++      : drupal_get_user_timezone();
++
++    // Although both 'min' and 'max' values are required, default empty 'min'
++    // value as UNIX timestamp 0.
++    $min = (!empty($this->value['min'])) ? $this->value['min'] : '@0';
++
++    $a = new DateTimePlus($min, new \DateTimeZone($timezone));
++    $b = new DateTimePlus($this->value['max'], new \DateTimeZone($timezone));
++
++    // For 'date' types with offset, user's 'now' could not be UTC 'now'. So
++    // calculate the difference between user's timezone and UTC.
++    $origin_offset = 0;
++    if ($this->dateFormat === DATETIME_DATE_STORAGE_FORMAT && $this->value['type'] === 'offset') {
++      $origin_offset = $origin_offset + timezone_offset_get(new \DateTimeZone(drupal_get_user_timezone()), new \DateTime($this->value['min'], new \DateTimeZone($timezone)));
++    }
+
+     // Convert to ISO format and format for query. UTC timezone is used since
+     // dates are stored in UTC.
+-    $a = $this->query->getDateFormat("'" . $this->dateFormatter->format($a, 'custom', DATETIME_DATETIME_STORAGE_FORMAT, DATETIME_STORAGE_TIMEZONE) . "'", $this->dateFormat, TRUE);
+-    $b = $this->query->getDateFormat("'" . $this->dateFormatter->format($b, 'custom', DATETIME_DATETIME_STORAGE_FORMAT, DATETIME_STORAGE_TIMEZONE) . "'", $this->dateFormat, TRUE);
++    $a = $this->query->getDateFormat($this->query->getDateField("'" . $this->dateFormatter->format($a->getTimestamp() + $origin_offset, 'custom', DATETIME_DATETIME_STORAGE_FORMAT, DATETIME_STORAGE_TIMEZONE) . "'", TRUE, $this->calculateOffset), $this->dateFormat, TRUE);
++    $b = $this->query->getDateFormat($this->query->getDateField("'" . $this->dateFormatter->format($b->getTimestamp() + $origin_offset, 'custom', DATETIME_DATETIME_STORAGE_FORMAT, DATETIME_STORAGE_TIMEZONE) . "'", TRUE, $this->calculateOffset), $this->dateFormat, TRUE);
+
+     // This is safe because we are manually scrubbing the values.
+     $operator = strtoupper($this->operator);
+-    $field = $this->query->getDateFormat($field, $this->dateFormat, TRUE);
++    $field = $this->query->getDateFormat($this->query->getDateField($field, TRUE, $this->calculateOffset), $this->dateFormat, TRUE);
+     $this->query->addWhereExpression($this->options['group'], "$field $operator $a AND $b");
+   }
+
+@@ -112,14 +134,24 @@ protected function opBetween($field) {
+    * Override parent method, which deals with dates as integers.
+    */
+   protected function opSimple($field) {
+-    $origin = (!empty($this->value['type']) && $this->value['type'] == 'offset') ? $this->requestStack->getCurrentRequest()->server->get('REQUEST_TIME') : 0;
+-    $value = intval(strtotime($this->value['value'], $origin));
++    $timezone = ($this->dateFormat === DATETIME_DATE_STORAGE_FORMAT)
++      ? DATETIME_STORAGE_TIMEZONE
++      : drupal_get_user_timezone();
++
++    $value = new DateTimePlus($this->value['value'], new \DateTimeZone($timezone));
++
++    // For 'date' types with offset, user's 'now' could not be UTC 'now'. So
++    // calculate the difference between user's timezone and UTC.
++    $origin_offset = 0;
++    if ($this->dateFormat === DATETIME_DATE_STORAGE_FORMAT && $this->value['type'] === 'offset') {
++      $origin_offset = $origin_offset + timezone_offset_get(new \DateTimeZone(drupal_get_user_timezone()), new \DateTime($this->value['value'], new \DateTimeZone($timezone)));
++    }
+
+-    // Convert to ISO. UTC is used since dates are stored in UTC.
+-    $value = $this->query->getDateFormat("'" . $this->dateFormatter->format($value, 'custom', DATETIME_DATETIME_STORAGE_FORMAT, DATETIME_STORAGE_TIMEZONE) . "'", $this->dateFormat, TRUE);
++    // Convert to ISO. UTC timezone is used since dates are stored in UTC.
++    $value = $this->query->getDateFormat($this->query->getDateField("'" . $this->dateFormatter->format($value->getTimestamp() + $origin_offset, 'custom', DATETIME_DATETIME_STORAGE_FORMAT, DATETIME_STORAGE_TIMEZONE) . "'", TRUE, $this->calculateOffset), $this->dateFormat, TRUE);
+
+     // This is safe because we are manually scrubbing the value.
+-    $field = $this->query->getDateFormat($field, $this->dateFormat, TRUE);
++    $field = $this->query->getDateFormat($this->query->getDateField($field, TRUE, $this->calculateOffset), $this->dateFormat, TRUE);
+     $this->query->addWhereExpression($this->options['group'], "$field $this->operator $value");
+   }
+
+diff --git a/core/modules/datetime/src/Plugin/views/sort/Date.php b/core/modules/datetime/src/Plugin/views/sort/Date.php
+index 2c8338a..0049e86 100644
+--- a/core/modules/datetime/src/Plugin/views/sort/Date.php
++++ b/core/modules/datetime/src/Plugin/views/sort/Date.php
+@@ -2,6 +2,8 @@
+
+ namespace Drupal\datetime\Plugin\views\sort;
+
++use Drupal\datetime\Plugin\Field\FieldType\DateTimeItem;
++use Drupal\views\FieldAPIHandlerTrait;
+ use Drupal\views\Plugin\views\sort\Date as NumericDate;
+
+ /**
+@@ -14,12 +16,38 @@
+  */
+ class Date extends NumericDate {
+
++  use FieldAPIHandlerTrait;
++
+   /**
++   * Determines if the timezone offset is calculated.
++   *
++   * @var bool
++   */
++  protected $calculateOffset = TRUE;
++
++  /**
++   * {@inheritdoc}
++   */
++  public function __construct(array $configuration, $plugin_id, $plugin_definition) {
++    parent::__construct($configuration, $plugin_id, $plugin_definition);
++
++    $definition = $this->getFieldStorageDefinition();
++    if ($definition->getSetting('datetime_type') === DateTimeItem::DATETIME_TYPE_DATE) {
++      // Timezone offset calculation is not applicable to dates that are stored
++      // as date-only.
++      $this->calculateOffset = FALSE;
++    }
++  }
++
++  /**
++   * {@inheritdoc}
++   *
+    * Override to account for dates stored as strings.
+    */
+   public function getDateField() {
+-    // Return the real field, since it is already in string format.
+-    return "$this->tableAlias.$this->realField";
++    // Use string date storage/formatting since datetime fields are stored as
++    // strings rather than UNIX timestamps.
++    return $this->query->getDateField("$this->tableAlias.$this->realField", TRUE, $this->calculateOffset);
+   }
+
+   /**
+diff --git a/core/modules/views/src/Plugin/views/query/MysqlDateSql.php b/core/modules/views/src/Plugin/views/query/MysqlDateSql.php
+new file mode 100644
+index 0000000..00ad873
+--- /dev/null
++++ b/core/modules/views/src/Plugin/views/query/MysqlDateSql.php
+@@ -0,0 +1,93 @@
++<?php
++
++namespace Drupal\views\Plugin\views\query;
++
++use Drupal\Core\Database\Connection;
++
++/**
++ * MySQL-specific date handling.
++ *
++ * @internal
++ *   This class should only be used by the Views SQL query plugin.
++ *
++ * @see \Drupal\views\Plugin\views\query\Sql
++ */
++class MysqlDateSql implements DateSqlInterface {
++
++  /**
++   * The database connection.
++   *
++   * @var \Drupal\Core\Database\Connection
++   */
++  protected $database;
++
++  /**
++   * An array of PHP-to-MySQL replacement patterns.
++   */
++  protected static $replace = [
++    'Y' => '%Y',
++    'y' => '%y',
++    'M' => '%b',
++    'm' => '%m',
++    'n' => '%c',
++    'F' => '%M',
++    'D' => '%a',
++    'd' => '%d',
++    'l' => '%W',
++    'j' => '%e',
++    'W' => '%v',
++    'H' => '%H',
++    'h' => '%h',
++    'i' => '%i',
++    's' => '%s',
++    'A' => '%p',
++  ];
++
++  /**
++   * Constructs the MySQL-specific date sql class.
++   *
++   * @param \Drupal\Core\Database\Connection $database
++   *   The database connection.
++   */
++  public function __construct(Connection $database) {
++    $this->database = $database;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getDateField($field, $string_date) {
++    if ($string_date) {
++      return $field;
++    }
++
++    // Base date field storage is timestamp, so the date to be returned here is
++    // epoch + stored value (seconds from epoch).
++    return "DATE_ADD('19700101', INTERVAL $field SECOND)";
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getDateFormat($field, $format) {
++    $format = strtr($format, static::$replace);
++    return "DATE_FORMAT($field, '$format')";
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setTimezoneOffset($offset) {
++    $this->database->query("SET @@session.time_zone = '$offset'");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setFieldTimezoneOffset(&$field, $offset) {
++    if (!empty($offset)) {
++      $field = "($field + INTERVAL $offset SECOND)";
++    }
++  }
++
++}
+diff --git a/core/modules/views/src/Plugin/views/query/PostgresqlDateSql.php b/core/modules/views/src/Plugin/views/query/PostgresqlDateSql.php
+new file mode 100644
+index 0000000..c03c416
+--- /dev/null
++++ b/core/modules/views/src/Plugin/views/query/PostgresqlDateSql.php
+@@ -0,0 +1,93 @@
++<?php
++
++namespace Drupal\views\Plugin\views\query;
++
++use Drupal\Core\Database\Connection;
++
++/**
++ * PostgreSQL-specific date handling.
++ *
++ * @internal
++ *   This class should only be used by the Views SQL query plugin.
++ *
++ * @see \Drupal\views\Plugin\views\query\Sql
++ */
++class PostgresqlDateSql implements DateSqlInterface {
++
++  /**
++   * The database connection.
++   *
++   * @var \Drupal\Core\Database\Connection
++   */
++  protected $database;
++
++  /**
++   * An array of PHP-to-PostgreSQL replacement patterns.
++   *
++   * @var array
++   */
++  protected static $replace = [
++    'Y' => 'YYYY',
++    'y' => 'YY',
++    'M' => 'Mon',
++    'm' => 'MM',
++    // No format for Numeric representation of a month, without leading zeros.
++    'n' => 'MM',
++    'F' => 'Month',
++    'D' => 'Dy',
++    'd' => 'DD',
++    'l' => 'Day',
++    // No format for Day of the month without leading zeros.
++    'j' => 'DD',
++    'W' => 'IW',
++    'H' => 'HH24',
++    'h' => 'HH12',
++    'i' => 'MI',
++    's' => 'SS',
++    'A' => 'AM',
++  ];
++
++  /**
++   * Constructs the PostgreSQL-specific date sql class.
++   *
++   * @param \Drupal\Core\Database\Connection $database
++   *   The database connection.
++   */
++  public function __construct(Connection $database) {
++    $this->database = $database;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getDateField($field, $string_date) {
++    if ($string_date) {
++      // Ensures compatibility with field offset operation below.
++      return "TO_TIMESTAMP($field, 'YYYY-MM-DD HH24:MI:SS')";
++    }
++    return "TO_TIMESTAMP($field)";
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getDateFormat($field, $format) {
++    $format = strtr($format, static::$replace);
++    return "TO_CHAR($field, '$format')";
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setFieldTimezoneOffset(&$field, $offset) {
++    $field = "($field + INTERVAL '$offset SECONDS')";
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setTimezoneOffset($offset) {
++    $this->database->query("SET TIME ZONE INTERVAL '$offset' HOUR TO MINUTE");
++  }
++
++}
+diff --git a/core/modules/views/src/Plugin/views/query/QueryPluginBase.php b/core/modules/views/src/Plugin/views/query/QueryPluginBase.php
+index a2c2e10..576959a 100644
+--- a/core/modules/views/src/Plugin/views/query/QueryPluginBase.php
++++ b/core/modules/views/src/Plugin/views/query/QueryPluginBase.php
+@@ -206,11 +206,17 @@ public function loadEntities(&$results) {}
+    *
+    * @param string $field
+    *   The query field that will be used in the expression.
++   * @param bool $string_date
++   *   For certain databases, date format functions vary depending on string or
++   *   numeric storage.
++   * @param bool $calculate_offset
++   *   If set to TRUE, the timezone offset will be included in the returned
++   *   field.
+    *
+    * @return string
+    *   An expression representing a timestamp with time zone.
+    */
+-  public function getDateField($field) {
++  public function getDateField($field, $string_date = FALSE, $calculate_offset = TRUE) {
+     return $field;
+   }
+
+@@ -346,6 +352,36 @@ public function getCacheTags() {
+     return [];
+   }
+
++  /**
++   * Applies a timezone offset to the given field.
++   *
++   * @param string &$field
++   *   The date field, in string format.
++   * @param int $offset
++   *   The timezone offset to apply to the field.
++   */
++  public function setFieldTimezoneOffset(&$field, $offset) {
++    // No-op. Timezone offsets are implementation-specific and should implement
++    // this method as needed.
++  }
++
++  /**
++   * Get the timezone offset in seconds.
++   *
++   * @return int
++   *   The offset, in seconds, for the timezone being used.
++   */
++  public function getTimezoneOffset() {
++    $timezone = $this->setupTimezone();
++    $offset = 0;
++    if ($timezone) {
++      $dtz = new \DateTimeZone($timezone);
++      $dt = new \DateTime('now', $dtz);
++      $offset = $dtz->getOffset($dt);
++    }
++    return $offset;
++  }
++
+ }
+
+ /**
+diff --git a/core/modules/views/src/Plugin/views/query/Sql.php b/core/modules/views/src/Plugin/views/query/Sql.php
+index ab056f5..fd70621 100644
+--- a/core/modules/views/src/Plugin/views/query/Sql.php
++++ b/core/modules/views/src/Plugin/views/query/Sql.php
+@@ -117,6 +117,13 @@ class Sql extends QueryPluginBase {
+   protected $entityTypeManager;
+
+   /**
++   * The database-specific date handler.
++   *
++   * @var \Drupal\views\Plugin\views\query\DateSqlInterface
++   */
++  protected $dateSql;
++
++  /**
+    * Constructs a Sql object.
+    *
+    * @param array $configuration
+@@ -127,11 +134,14 @@ class Sql extends QueryPluginBase {
+    *   The plugin implementation definition.
+    * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager
+    *   The entity type manager.
++   * @param \Drupal\views\Plugin\views\query\DateSqlInterface $date_sql
++   *   The database-specific date handler.
+    */
+-  public function __construct(array $configuration, $plugin_id, $plugin_definition, EntityTypeManagerInterface $entity_type_manager) {
++  public function __construct(array $configuration, $plugin_id, $plugin_definition, EntityTypeManagerInterface $entity_type_manager, DateSqlInterface $date_sql) {
+     parent::__construct($configuration, $plugin_id, $plugin_definition);
+
+     $this->entityTypeManager = $entity_type_manager;
++    $this->dateSql = $date_sql;
+   }
+
+   public static function create(ContainerInterface $container, array $configuration, $plugin_id, $plugin_definition) {
+@@ -139,7 +149,8 @@ public static function create(ContainerInterface $container, array $configuratio
+       $configuration,
+       $plugin_id,
+       $plugin_definition,
+-      $container->get('entity_type.manager')
++      $container->get('entity_type.manager'),
++      $container->get('views.date_sql')
+     );
+   }
+
+@@ -1755,175 +1766,40 @@ public function aggregationMethodDistinct($group_type, $field) {
+   /**
+    * {@inheritdoc}
+    */
+-  public function getDateField($field) {
+-    $db_type = Database::getConnection()->databaseType();
+-    $offset = $this->setupTimezone();
+-    if (isset($offset) && !is_numeric($offset)) {
+-      $dtz = new \DateTimeZone($offset);
+-      $dt = new \DateTime('now', $dtz);
+-      $offset_seconds = $dtz->getOffset($dt);
+-    }
+-
+-    switch ($db_type) {
+-      case 'mysql':
+-        $field = "DATE_ADD('19700101', INTERVAL $field SECOND)";
+-        if (!empty($offset)) {
+-          $field = "($field + INTERVAL $offset_seconds SECOND)";
+-        }
+-        break;
+-      case 'pgsql':
+-        $field = "TO_TIMESTAMP($field)";
+-        if (!empty($offset)) {
+-          $field = "($field + INTERVAL '$offset_seconds SECONDS')";
+-        }
+-        break;
+-      case 'sqlite':
+-        if (!empty($offset)) {
+-          $field = "($field + $offset_seconds)";
+-        }
+-        break;
++  public function getDateField($field, $string_date = FALSE, $calculate_offset = TRUE) {
++    $field = $this->dateSql->getDateField($field, $string_date);
++    if ($calculate_offset && $offset = $this->getTimezoneOffset()) {
++      $this->setFieldTimezoneOffset($field, $offset);
+     }
+-
+     return $field;
+   }
+
+   /**
+    * {@inheritdoc}
+    */
+-  public function setupTimezone() {
+-    $timezone = drupal_get_user_timezone();
+-
+-    // set up the database timezone
+-    $db_type = Database::getConnection()->databaseType();
+-    if (in_array($db_type, ['mysql', 'pgsql'])) {
+-      $offset = '+00:00';
+-      static $already_set = FALSE;
+-      if (!$already_set) {
+-        if ($db_type == 'pgsql') {
+-          Database::getConnection()->query("SET TIME ZONE INTERVAL '$offset' HOUR TO MINUTE");
+-        }
+-        elseif ($db_type == 'mysql') {
+-          Database::getConnection()->query("SET @@session.time_zone = '$offset'");
+-        }
++  public function setFieldTimezoneOffset(&$field, $offset) {
++    $this->dateSql->setFieldTimezoneOffset($field, $offset);
++  }
+
+-        $already_set = TRUE;
+-      }
++  /**
++   * {@inheritdoc}
++   */
++  public function setupTimezone() {
++    // Set the database timezone offset.
++    static $already_set = FALSE;
++    if (!$already_set) {
++      $this->dateSql->setTimezoneOffset('+00:00');
++      $already_set = TRUE;
+     }
+
+-    return $timezone;
++    return parent::setupTimezone();
+   }
+
+   /**
+    * {@inheritdoc}
+    */
+   public function getDateFormat($field, $format, $string_date = FALSE) {
+-    $db_type = Database::getConnection()->databaseType();
+-    switch ($db_type) {
+-      case 'mysql':
+-        $replace = [
+-          'Y' => '%Y',
+-          'y' => '%y',
+-          'M' => '%b',
+-          'm' => '%m',
+-          'n' => '%c',
+-          'F' => '%M',
+-          'D' => '%a',
+-          'd' => '%d',
+-          'l' => '%W',
+-          'j' => '%e',
+-          'W' => '%v',
+-          'H' => '%H',
+-          'h' => '%h',
+-          'i' => '%i',
+-          's' => '%s',
+-          'A' => '%p',
+-        ];
+-        $format = strtr($format, $replace);
+-        return "DATE_FORMAT($field, '$format')";
+-      case 'pgsql':
+-        $replace = [
+-          'Y' => 'YYYY',
+-          'y' => 'YY',
+-          'M' => 'Mon',
+-          'm' => 'MM',
+-          // No format for Numeric representation of a month, without leading
+-          // zeros.
+-          'n' => 'MM',
+-          'F' => 'Month',
+-          'D' => 'Dy',
+-          'd' => 'DD',
+-          'l' => 'Day',
+-          // No format for Day of the month without leading zeros.
+-          'j' => 'DD',
+-          'W' => 'IW',
+-          'H' => 'HH24',
+-          'h' => 'HH12',
+-          'i' => 'MI',
+-          's' => 'SS',
+-          'A' => 'AM',
+-        ];
+-        $format = strtr($format, $replace);
+-        if (!$string_date) {
+-          return "TO_CHAR($field, '$format')";
+-        }
+-        // In order to allow for partials (eg, only the year), transform to a
+-        // date, back to a string again.
+-        return "TO_CHAR(TO_TIMESTAMP($field, 'YYYY-MM-DD HH24:MI:SS'), '$format')";
+-      case 'sqlite':
+-        $replace = [
+-          'Y' => '%Y',
+-          // No format for 2 digit year number.
+-          'y' => '%Y',
+-          // No format for 3 letter month name.
+-          'M' => '%m',
+-          'm' => '%m',
+-          // No format for month number without leading zeros.
+-          'n' => '%m',
+-          // No format for full month name.
+-          'F' => '%m',
+-          // No format for 3 letter day name.
+-          'D' => '%d',
+-          'd' => '%d',
+-          // No format for full day name.
+-          'l' => '%d',
+-          // no format for day of month number without leading zeros.
+-          'j' => '%d',
+-          'W' => '%W',
+-          'H' => '%H',
+-          // No format for 12 hour hour with leading zeros.
+-          'h' => '%H',
+-          'i' => '%M',
+-          's' => '%S',
+-          // No format for AM/PM.
+-          'A' => '',
+-        ];
+-        $format = strtr($format, $replace);
+-
+-        // Don't use the 'unixepoch' flag for string date comparisons.
+-        $unixepoch = $string_date ? '' : ", 'unixepoch'";
+-
+-        // SQLite does not have a ISO week substitution string, so it needs
+-        // special handling.
+-        // @see http://wikipedia.org/wiki/ISO_week_date#Calculation
+-        // @see http://stackoverflow.com/a/15511864/1499564
+-        if ($format === '%W') {
+-          $expression = "((strftime('%j', date(strftime('%Y-%m-%d', $field" . $unixepoch . "), '-3 days', 'weekday 4')) - 1) / 7 + 1)";
+-        }
+-        else {
+-          $expression = "strftime('$format', $field" . $unixepoch . ")";
+-        }
+-        // The expression yields a string, but the comparison value is an
+-        // integer in case the comparison value is a float, integer, or numeric.
+-        // All of the above SQLite format tokens only produce integers. However,
+-        // the given $format may contain 'Y-m-d', which results in a string.
+-        // @see \Drupal\Core\Database\Driver\sqlite\Connection::expandArguments()
+-        // @see http://www.sqlite.org/lang_datefunc.html
+-        // @see http://www.sqlite.org/lang_expr.html#castexpr
+-        if (preg_match('/^(?:%\w)+$/', $format)) {
+-          $expression = "CAST($expression AS NUMERIC)";
+-        }
+-        return $expression;
+-    }
++    return $this->dateSql->getDateFormat($field, $format);
+   }
+
+ }
+diff --git a/core/modules/views/src/Plugin/views/query/SqliteDateSql.php b/core/modules/views/src/Plugin/views/query/SqliteDateSql.php
+new file mode 100644
+index 0000000..628e1c6
+--- /dev/null
++++ b/core/modules/views/src/Plugin/views/query/SqliteDateSql.php
+@@ -0,0 +1,122 @@
++<?php
++
++namespace Drupal\views\Plugin\views\query;
++
++use Drupal\Core\Database\Connection;
++
++/**
++ * SQLite-specific date handling.
++ *
++ * @internal
++ *   This class should only be used by the Views SQL query plugin.
++ *
++ * @see \Drupal\views\Plugin\views\query\Sql
++ */
++class SqliteDateSql implements DateSqlInterface {
++
++  /**
++   * The database connection.
++   *
++   * @var \Drupal\Core\Database\Connection
++   */
++  protected $database;
++
++  /**
++   * An array of PHP-to-SQLite date replacement patterns.
++   *
++   * @var array
++   */
++  protected static $replace = [
++    'Y' => '%Y',
++    // No format for 2 digit year number.
++    'y' => '%Y',
++    // No format for 3 letter month name.
++    'M' => '%m',
++    'm' => '%m',
++    // No format for month number without leading zeros.
++    'n' => '%m',
++    // No format for full month name.
++    'F' => '%m',
++    // No format for 3 letter day name.
++    'D' => '%d',
++    'd' => '%d',
++    // No format for full day name.
++    'l' => '%d',
++    // no format for day of month number without leading zeros.
++    'j' => '%d',
++    'W' => '%W',
++    'H' => '%H',
++    // No format for 12 hour hour with leading zeros.
++    'h' => '%H',
++    'i' => '%M',
++    's' => '%S',
++    // No format for AM/PM.
++    'A' => '',
++  ];
++
++  /**
++   * Constructs the SQLite-specific date sql class.
++   *
++   * @param \Drupal\Core\Database\Connection $database
++   *   The database connection.
++   */
++  public function __construct(Connection $database) {
++    $this->database = $database;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getDateField($field, $string_date) {
++    if ($string_date) {
++      $field = "strftime('%s', $field)";
++    }
++    return $field;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getDateFormat($field, $format) {
++    $format = strtr($format, static::$replace);
++
++    // SQLite does not have a ISO week substitution string, so it needs special
++    // handling.
++    // @see http://wikipedia.org/wiki/ISO_week_date#Calculation
++    // @see http://stackoverflow.com/a/15511864/1499564
++    if ($format === '%W') {
++      $expression = "((strftime('%j', date(strftime('%Y-%m-%d', $field, 'unixepoch'), '-3 days', 'weekday 4')) - 1) / 7 + 1)";
++    }
++    else {
++      $expression = "strftime('$format', $field, 'unixepoch')";
++    }
++    // The expression yields a string, but the comparison value is an integer in
++    // case the comparison value is a float, integer, or numeric. All of the
++    // above SQLite format tokens only produce integers. However, the given
++    // $format may contain 'Y-m-d', which results in a string.
++    // @see \Drupal\Core\Database\Driver\sqlite\Connection::expandArguments()
++    // @see http://www.sqlite.org/lang_datefunc.html
++    // @see http://www.sqlite.org/lang_expr.html#castexpr
++    if (preg_match('/^(?:%\w)+$/', $format)) {
++      $expression = "CAST($expression AS NUMERIC)";
++    }
++    return $expression;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setTimezoneOffset($offset) {
++    // Nothing to do here.
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setFieldTimezoneOffset(&$field, $offset, $string_date = FALSE) {
++    if (!empty($offset)) {
++      $field = "($field + $offset)";
++    }
++  }
++
++}
+diff --git a/core/modules/views/views.post_update.php b/core/modules/views/views.post_update.php
+index e09159e..f8faaec 100644
+--- a/core/modules/views/views.post_update.php
++++ b/core/modules/views/views.post_update.php
+@@ -213,3 +213,10 @@ function views_post_update_revision_metadata_fields() {
+     $view->save();
+   });
+ }
++
++/**
++ * Rebuild the container to add a new container parameter.
++ */
++function views_post_update_date_sql_service() {
++  // Empty update to cause a cache rebuild so that the container is rebuilt.
++}
+diff --git a/core/modules/views/views.services.yml b/core/modules/views/views.services.yml
+index 28f8d0d..ffed394 100644
+--- a/core/modules/views/views.services.yml
++++ b/core/modules/views/views.services.yml
+@@ -80,3 +80,16 @@ services:
+     arguments: ['@entity.manager']
+     tags:
+       - { name: 'event_subscriber' }
++  views.date_sql:
++    class: Drupal\views\Plugin\views\query\MysqlDateSql
++    arguments: ['@database']
++    tags:
++       - { name: backend_overridable }
++  pgsql.views.date_sql:
++    class: Drupal\views\Plugin\views\query\PostgresqlDateSql
++    arguments: ['@database']
++    public: false
++  sqlite.views.date_sql:
++    class: Drupal\views\Plugin\views\query\SqliteDateSql
++    arguments: ['@database']
++    public: false
